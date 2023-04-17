@@ -1,0 +1,511 @@
+---
+title: "Big Cats Classification - modified from Kaggle notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup}
+library(reticulate)
+```
+
+### Python Setup
+
+```{python}
+import os
+from glob import glob
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from typing import Tuple, List
+
+# Data Imports
+import pandas as pd
+from tqdm import tqdm
+from tensorflow import image as tfi
+
+# Data Visualization
+import plotly.express as px
+import matplotlib.pyplot as plt
+#from IPython.display import clear_output as cls
+
+# Model Architecture
+from tensorflow.keras import Sequential
+from tensorflow.keras.applications import ResNet50V2
+from tensorflow.keras.applications import ResNet152V2
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.applications import Xception
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dropout, Dense
+
+# Model Training
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+# Model Hypertunning
+#!pip install -q keras_tuner
+#cls()
+import keras_tuner as kt
+
+train_dir = '/home/jeremy/Downloads/kaggle/train/'
+test_dir = '/home/jeremy/Downloads/kaggle/test/'
+valid_dir = '/home/jeremy/Downloads/kaggle/valid/'
+
+# Get all class names and count the number of classes
+class_names = os.listdir(train_dir)
+n_classes = len(class_names)
+
+# Set some constants for the dataset
+BATCH_SIZE = 32 # Number of samples in each batch during training
+IMG_SIZE = 224 # Size of the image
+AUTOTUNE = tf.data.AUTOTUNE # Set to optimize the buffer size automatically
+LEARNING_RATE = 1e-3 # Learning rate for the optimizer used during model training
+
+# Set the random seed for reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+gpu_devices = tf.config.experimental.list_physical_devices('GPU')
+for device in gpu_devices:
+    tf.config.experimental.set_memory_growth(device, True)
+
+```
+
+### load image function
+
+```{python}
+def load_image(image_path: str) -> tf.Tensor:
+    '''
+    The task of the function is to load the image present in the specified given image path. Loading the image the function also performed some 
+    preprocessing steps such as resizing and normalization.
+    
+    Argument:
+        image_path(str) : This is a string which represents the location of the image file to be loaded.
+        
+    Returns:
+        image(tf.Tensor) : This is the image which is loaded from the given image part in the form of a tensor.
+    '''
+    # Check if image path exists
+    assert os.path.exists(image_path), f'Invalid image path: {image_path}'
+    # Load the image
+    image = plt.imread(image_path)
+    # Resize the Image
+    image = tfi.resize(image, (IMG_SIZE, IMG_SIZE))
+    # Convert image data type to tf.float32
+    image = tf.cast(image, tf.float32)
+    # Normalize the image to bring pixel values between 0 - 1
+    image = image/255.0
+    
+    return image
+```
+
+### load dataset function
+
+```{python}
+def load_dataset(root_path: str, class_names: list, batch_size: int = 32, buffer_size: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Load and preprocess images from the given root path and return them as numpy arrays.
+
+    Args:
+        root_path (str): Path to the root directory where all the subdirectories (class names) are present.
+        class_names (list): List of the names of all the subdirectories (class names).
+        batch_size (int): Batch size of the final dataset. Defaults to 32.
+        buffer_size (int): Buffer size to use when shuffling the data. Defaults to 1000.
+
+    Returns:
+        Two numpy arrays, one containing the images and the other containing their respective labels.
+    '''
+    # Collect total number of data samples
+    n_samples = sum([len(os.listdir(os.path.join(root_path, name))) for name in class_names])
+    # Create arrays to store images and labels
+    images = np.empty(shape=(n_samples, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
+    labels = np.empty(shape=(n_samples, 1), dtype=np.int32)
+    # Loop over all the image file paths, load and store the images with respective labels
+    n_image = 0
+    for class_name in tqdm(class_names, desc="Loading"):
+        class_path = os.path.join(root_path, class_name)
+        for file_path in glob(os.path.join(class_path, "*")):
+            # Load the image
+            image = load_image(file_path)
+            # Assign label
+            label = class_names.index(class_name)
+            # Store the image and the respective label
+            images[n_image] = image
+            labels[n_image] = label
+            # Increment the number of images processed
+            n_image += 1
+    # Shuffle the data
+    indices = np.random.permutation(n_samples)
+    images = images[indices]
+    labels = labels[indices]
+
+    return images, labels
+```
+
+### Train model
+
+```{python}
+# Load the training dataset
+X_train, y_train = load_dataset(root_path = train_dir, class_names = class_names)
+# Load the validation dataset
+X_valid, y_valid = load_dataset(root_path = valid_dir, class_names = class_names)
+# Load the testing dataset
+X_test, y_test = load_dataset(root_path = test_dir, class_names = class_names)
+
+```
+
+### Data Exploration
+
+```{python}
+def show_images(images: np.ndarray, labels: np.ndarray, n_rows: int=1, n_cols: int=5, figsize: tuple=(25, 8), model: tf.keras.Model=None) -> None:
+    """
+    Plots a grid of random images and their corresponding labels, with an optional prediction from a given model.
+
+    Args:
+        images (np.ndarray): Array of images to plot.
+        labels (np.ndarray): Array of labels corresponding to the images.
+        n_rows (int): Number of rows in the plot grid. Default is 1.
+        n_cols (int): Number of columns in the plot grid. Default is 5.
+        figsize (tuple): A tuple specifying the size of the figure. Default is (25, 8).
+        model (tf.keras.Model): A Keras model object used to make predictions on the images. Default is None.
+
+    Returns:
+        None
+    """
+
+    # Loop over each row of the plot
+    for row in range(n_rows):
+        # Create a new figure for each row
+        plt.figure(figsize=figsize)
+
+        # Generate a random index for each column in the row
+        rand_indices = np.random.choice(len(images), size=n_cols, replace=False)
+
+        # Loop over each column of the plot
+        for col, index in enumerate(rand_indices):
+            # Get the image and label at the random index
+            image = images[index]
+            label = class_names[int(labels[index])]
+
+            # If a model is provided, make a prediction on the image
+            if model:
+                prediction = model.predict(np.expand_dims(tf.squeeze(image), axis=0), verbose=0)[0]
+                label += f"\nPrediction: {class_names[np.argmax(prediction)]}"
+
+            # Plot the image and label
+            plt.subplot(1, n_cols, col+1)
+            plt.imshow(image)
+            plt.title(label.title())
+            plt.axis("off")
+
+        # Show the row of images
+        plt.show()
+        
+show_images(images=X_train, labels=y_train, n_rows=5)
+```
+
+```{python}
+# Collect all backbones
+BACKBONES =[
+    ResNet50V2(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False),
+    ResNet152V2(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False),
+    InceptionV3(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False),
+    Xception(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False),
+    MobileNetV2(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False),
+]
+
+# Define all the backbone names. This will be later used during visualization
+BACKBONES_NAMES = [
+    'ResNet50V2',
+    'ResNet152V2',
+    'InceptionV3',
+    'Xception',
+    'MobileNetV2',
+]
+
+# Freeze the weights of all the backbones
+for backbone in BACKBONES:
+    backbone.trainable = False
+```
+
+```{python}
+# Set the size of the subset
+subset_size = 1500
+
+# Generate a random subset of indices
+subset_indices = np.random.choice(len(X_train), size=subset_size, replace=False)
+
+# Use the indices to extract a subset of the training data
+X_sub, y_sub = X_train[subset_indices], y_train[subset_indices]
+```
+
+```{python}
+# Initialize an empty list to hold the histories of each backbone architecture.
+HISTORIES = []
+
+# Loop over every backbone in the BACKBONES list.
+for backbone in tqdm(BACKBONES, desc="Training Backbone"):
+    
+    # Create the simplest model architecture using the current backbone.
+    model = Sequential([
+        backbone,
+        GlobalAveragePooling2D(),
+        Dropout(0.5),
+        Dense(n_classes, activation='softmax')
+    ])
+    
+    # Compile the model with the specified loss function, optimizer, and metrics.
+    model.compile(
+        loss='sparse_categorical_crossentropy',
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        metrics='accuracy'
+    )
+    
+    # Train the model on a subset of the training data.
+    history = model.fit(
+        X_sub, y_sub,
+        epochs=10,
+        validation_split=0.2,
+        batch_size=BATCH_SIZE
+    )
+        
+    # Store the history of the trained model.
+    HISTORIES.append(history.history)
+```
+
+```{python}
+# Convert all the histories into Pandas data frame.
+HISTORIES_DF = [pd.DataFrame(history) for history in HISTORIES]
+
+# Loop over the model training curves
+for index, (name, history) in enumerate(zip(BACKBONES_NAMES, HISTORIES_DF)):
+    
+    # Create a new figure for each backbone
+    plt.figure(figsize=(20,5))
+    
+    # Plot the loss curve in the first subplot
+    plt.subplot(1, 2, 1)
+    plt.title(f"{name} - Loss Curve")
+    plt.plot(history['loss'], label="Training Loss")
+    plt.plot(history['val_loss'], label="Validation Loss")
+    
+    # Plot a vertical line at epoch 9 and annotate the difference between the validation loss and the training loss
+    plt.plot([9, 9],[min(history['loss']), min(history['val_loss'])], linestyle='--', marker="*", color='k', alpha=0.7)
+    plt.text(x=9.1, y=np.mean([min(history['loss']), min(history['val_loss'])]), s=str(np.round(min(history['val_loss']) - min(history['loss']),3)), fontsize=15, color='b')
+    
+    # Plot a horizontal line at epoch 9 and annotate the values for the validation loss and training loss.
+    plt.axhline(min(history['loss']), color='g', linestyle="--", alpha=0.5)
+    
+    # Set the x- and y-labels, and the x- and y-limits
+    plt.xlabel("Epochs")
+    plt.ylabel("Cross Entropy Loss")
+    plt.ylim([0.1, 0.3])
+    plt.xlim([5, 10])
+    
+    # Show the legend and grid
+    plt.legend()
+    plt.grid()
+    
+    # Plot the accuracy curve in the second subplot
+    plt.subplot(1, 2, 2)
+    plt.title(f"{name} - Accuracy Curve")
+    plt.plot(history['accuracy'], label="Training Accuracy")
+    plt.plot(history['val_accuracy'], label="Validation Accuracy")
+    
+    # Plot a vertical line at epoch 9 and annotate the difference between the validation accuracy and the training accuracy
+    plt.plot([9, 9],[max(history['accuracy']), max(history['val_accuracy'])], linestyle='--', marker="*", color='k', alpha=0.7)
+    plt.text(x=9.1, y=np.mean([max(history['accuracy']), max(history['val_accuracy'])]), s=str(np.round(max(history['accuracy']) - max(history['val_accuracy']),3)), fontsize=15, color='b')
+    
+    # Set the x- and y-labels, and the x- and y-limits
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy")
+    plt.ylim([0.9,1.0])
+    plt.xlim([0.5, 10])
+    
+    # Show the legend and grid
+    plt.legend()
+    plt.grid()
+    
+    # Show the plot
+    plt.show()
+```
+
+```{python}
+# Get the index of the Xception and ResNet152V2 Backbone
+xception_index = BACKBONES_NAMES.index('Xception')
+resnet_index = BACKBONES_NAMES.index('ResNet152V2')
+
+# Define the figure configuration
+plt.figure(figsize=(25,10))
+
+# Subplot for training loss comparision
+plt.subplot(2, 2, 1)
+plt.title("Training Loss Comparison")
+plt.plot(HISTORIES[xception_index]['loss'], label="Xception")
+plt.plot(HISTORIES[resnet_index]['loss'], label="ResNet152V2")
+plt.xlabel("Epochs")
+plt.ylabel("Cross Entropy Loss")
+plt.legend()
+plt.grid()
+
+# Subplot for validation loss comparision
+plt.subplot(2, 2, 2)
+plt.title("Validation Loss Comparison")
+plt.plot(HISTORIES[xception_index]['val_loss'], label="Xception")
+plt.plot(HISTORIES[resnet_index]['val_loss'], label="ResNet152V2")
+plt.xlabel("Epochs")
+plt.ylabel("Cross Entropy Loss")
+plt.legend()
+plt.grid()
+
+# Subplot for training accuracy comparision
+plt.subplot(2, 2, 3)
+plt.title("Training Accuracy Comparison")
+plt.plot(HISTORIES[xception_index]['accuracy'], label="Xception")
+plt.plot(HISTORIES[resnet_index]['accuracy'], label="ResNet152V2")
+plt.xlabel("Epochs")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid()
+
+# Subplot for validation accuracy comparision
+plt.subplot(2, 2, 4)
+plt.title("Validation Accuracy Comparison")
+plt.plot(HISTORIES[xception_index]['val_accuracy'], label="Xception")
+plt.plot(HISTORIES[resnet_index]['val_accuracy'], label="ResNet152V2")
+plt.xlabel("Epochs")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid()
+
+plt.show()
+```
+
+```{python}
+# Xception Backbone
+xception = Xception(input_shape=(IMG_SIZE, IMG_SIZE, 3), weights='imagenet', include_top=False)
+
+# Freeze the model weights
+xception.trainable = True
+
+# The Xception Model baseline
+xbaseline = Sequential([
+    xception,
+    GlobalAveragePooling2D(),
+    Dropout(0.5),
+    Dense(n_classes, activation='softmax')
+])
+
+# Compile the Baseline
+xbaseline.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=Adam(learning_rate=LEARNING_RATE),
+    metrics=['accuracy']
+)
+
+# Train the Xception Baseline Model
+xbaseline.fit(
+    X_train, y_train, 
+    validation_data=(X_valid, y_valid), 
+    epochs=50, 
+    callbacks=[
+        EarlyStopping(patience=3, restore_best_weights=True),
+        ModelCheckpoint("XceptionBaseline.h5", save_best_only=True)
+    ],
+    batch_size=BATCH_SIZE
+)
+cls()
+
+# Testing Evaluation
+xtest_loss, xtest_acc = xbaseline.evaluate(X_test, y_test)
+print(f"Xception Baseline Testing Loss     : {xtest_loss}.")
+print(f"Xception Baseline Testing Accuracy : {xtest_acc}.")
+```
+### Build Model
+
+```{python}
+def build_model(hp):
+    
+    # Define all hyperparms
+    n_layers = hp.Choice('n_layers', [0, 2, 4])
+    dropout_rate = hp.Choice('rate', [0.2, 0.4, 0.5, 0.7])
+    n_units = hp.Choice('units', [64, 128, 256, 512])
+    
+    # Mode architecture
+    model = Sequential([
+        xception,
+        GlobalAveragePooling2D(),
+    ])
+    
+    # Add hidden/top layers 
+    for _ in range(n_layers):
+        model.add(Dense(n_units, activation='relu', kernel_initializer='he_normal'))
+    
+    # Add Dropout Layer
+    model.add(Dropout(dropout_rate))
+    
+    # Output Layer
+    model.add(Dense(n_classes, activation='softmax'))
+    
+    # Compile the model
+    model.compile(
+        loss='sparse_categorical_crossentropy',
+        optimizer = Adam(LEARNING_RATE),
+        metrics = ['accuracy']
+    )
+    
+    # Return model
+    return model
+```
+
+### Initialize Random Searcher
+
+```{python}
+# Initialize Random Searcher
+random_searcher = kt.RandomSearch(
+    hypermodel=build_model, 
+    objective='val_loss', 
+    max_trials=10, 
+    seed=42, 
+    project_name="XceptionSearch", 
+    loss='sparse_categorical_crossentropy')
+
+# Start Searching
+search = random_searcher.search(
+    X_train, y_train,
+    validation_data=(X_valid, y_valid),
+    epochs = 10,
+    batch_size = BATCH_SIZE
+)
+```
+
+### Get the best model
+
+```{python}
+# Collect the best model Xception Model Architecture obtained by Random Searcher
+best_xception = build_model(random_searcher.get_best_hyperparameters(num_trials=1)[0])
+
+# Model Architecture
+best_xception.summary()
+
+# Compile Model
+best_xception.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=Adam(LEARNING_RATE*0.1),
+    metrics=['accuracy']
+)
+
+# Model Training
+best_xception_history = best_xception.fit(
+    X_train, y_train,
+    validation_data=(X_valid, y_valid),
+    epochs = 50,
+    batch_size = BATCH_SIZE*2,
+    callbacks = [
+        EarlyStopping(patience=2, restore_best_weights=True),
+        ModelCheckpoint("BestXception.h5", save_best_only=True)
+    ]
+)
+```
